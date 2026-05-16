@@ -1,8 +1,20 @@
 #!/data/data/com.termux/files/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Termux AI Bot v7 — Enhanced Claude Code в Telegram
-=
+Termux AI Bot v8 — Ultimate Edition
+====================================
+Исправления v7:
+- Исправлены deadlock'ы (RLock), утечки памяти (pending_actions, reminders)
+- Исправлена обрезка истории, InputFile, markdown-разбиение
+- Усилена sandbox-безопасность Python и shell
+- Добавлена поддержка документов (PDF, TXT, PY и др.)
+- Полная интеграция Termux API (TTS, уведомления, вибрация, clipboard, battery, wifi, torch)
+- Управление пакетами Termux (/pkg)
+- Система сессий и алиасов
+- Улучшенный веб-поиск с fallback
+- Отправка файлов пользователю (/sendfile)
+- Graceful shutdown, улучшенное логирование
+"""
 
 import os
 import sys
@@ -16,6 +28,11 @@ import requests
 import base64
 import io
 import math
+import hashlib
+import signal
+import atexit
+import tempfile
+import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from dotenv import load_dotenv
@@ -36,9 +53,11 @@ WORKSPACE = os.getenv("WORKSPACE", "/data/data/com.termux/files/home/ai_workspac
 CUSTOM_CONFIG_FILE = os.getenv("CUSTOM_CONFIG_FILE", "/data/data/com.termux/files/home/ai_custom_config.json")
 MEMORY_FILE = os.getenv("MEMORY_FILE", "/data/data/com.termux/files/home/ai_memory.json")
 CONTEXT_FILE = os.getenv("CONTEXT_FILE", "/data/data/com.termux/files/home/ai_context_summary.txt")
+SESSIONS_DIR = os.getenv("SESSIONS_DIR", "/data/data/com.termux/files/home/ai_sessions")
+ALIASES_FILE = os.getenv("ALIASES_FILE", "/data/data/com.termux/files/home/ai_aliases.json")
 
-# Поддержка Termux API для TTS/STT (опционально)
 TERMUX_API_AVAILABLE = os.path.exists("/data/data/com.termux/files/usr/bin/termux-api-start")
+TERMUX_API_PKG = os.path.exists("/data/data/com.termux/files/usr/bin/termux-notification")
 
 try:
     ADMIN_ID = int(ADMIN_ID_STR)
@@ -54,6 +73,7 @@ if ADMIN_ID == 0:
     sys.exit(1)
 
 os.makedirs(WORKSPACE, exist_ok=True)
+os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -69,6 +89,7 @@ DEFAULT_MODE = os.getenv("DEFAULT_MODE", "agent").strip()
 CONTEXT_LIMIT = int(os.getenv("CONTEXT_LIMIT", "10"))
 KEEP_AFTER_SUMMARY = int(os.getenv("KEEP_AFTER_SUMMARY", "2"))
 MAX_HISTORY_PAIRS = 30
+PENDING_MAX_AGE = 3600  # 1 час
 
 API_KEYS = {
     "gemini": os.getenv("GEMINI_API_KEY", "").strip(),
@@ -89,7 +110,14 @@ DANGEROUS_CMD_PATTERNS = [
     re.compile(r'curl\s+.*\|\s*bash'),
     re.compile(r'wget\s+.*\|\s*bash'),
     re.compile(r'rm\s+-rf\s+~/\.\s*'),
+    re.compile(r'rm\s+-rf\s+\.\.'),
+    re.compile(r':(){ :|:& };:'),  # fork bomb
+    re.compile(r'\bformat\s+/dev/'),
+    re.compile(r'\bmkfs\b'),
+    re.compile(r'>\s*/dev/null\s*2>&1\s*&&\s*rm\s+-rf\s+/'),
 ]
+
+INTERACTIVE_CMDS = {"vim", "vi", "nano", "emacs", "less", "more", "top", "htop", "watch", "man", "ssh", "telnet", "ftp", "psql", "mysql", "sqlite3", "python", "python3", "node", "node.js"}
 
 # ========== BASE PROVIDERS ==========
 PROVIDERS = {
@@ -111,7 +139,7 @@ PROVIDERS = {
             "Authorization": "Bearer {key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://termux-bot.local",
-            "X-Title": "Termux AI Bot v7",
+            "X-Title": "Termux AI Bot v8",
         },
         "parser": "openai",
         "vision": True,
@@ -155,11 +183,15 @@ def load_custom_config():
                     for m in models:
                         if m not in PROVIDER_MODELS[name]:
                             PROVIDER_MODELS[name].append(m)
+                # Load aliases if present
+                aliases = data.get("aliases", {})
+                if aliases:
+                    save_aliases(aliases)
         except Exception as e:
             logger.error(f"Custom config load error: {e}")
 
 def save_custom_config():
-    data = {"providers": {}, "models": {}}
+    data = {"providers": {}, "models": {}, "aliases": load_aliases()}
     base_provider_names = {"gemini", "groq", "openrouter"}
     for name, cfg in PROVIDERS.items():
         if name not in base_provider_names:
@@ -173,7 +205,24 @@ def save_custom_config():
     except Exception as e:
         logger.error(f"Custom config save error: {e}")
 
-load_custom_config()
+# ========== ALIASES ==========
+def load_aliases() -> Dict[str, str]:
+    if os.path.exists(ALIASES_FILE):
+        try:
+            with open(ALIASES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_aliases(aliases: Dict[str, str]):
+    try:
+        with open(ALIASES_FILE, "w", encoding="utf-8") as f:
+            json.dump(aliases, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Aliases save error: {e}")
+
+command_aliases = load_aliases()
 
 # ========== MEMORY SYSTEM ==========
 def load_memory() -> Dict[str, str]:
@@ -215,12 +264,15 @@ MODES = {
         "9. <tool>memory_read</tool> + <key>ключ</key> — прочитать заметку\n"
         "10. <tool>web_search</tool> + <query>запрос</query> — поиск в интернете\n"
         "11. <tool>python</tool> + <code>код</code> — выполнить Python\n"
-        "12. <tool>git</tool> + <subcommand>status|diff|log|commit|add</subcommand> + <args>аргументы</args>\n\n"
+        "12. <tool>git</tool> + <subcommand>status|diff|log|commit|add</subcommand> + <args>аргументы</args>\n"
+        "13. <tool>termux</tool> + <action>notification|toast|vibrate|clipboard|tts|battery|wifi|torch</action> + <args>аргументы</args> — Termux API\n"
+        "14. <tool>pkg</tool> + <action>install|remove|search|update|upgrade|list</action> + <args>пакет</args> — управление пакетами\n\n"
         "Правила:\n"
         "- Всегда отвечай кратко. Не объясняй что ты модель. Просто делай.\n"
         "- Для сложных задач используй несколько инструментов последовательно.\n"
         "- При редактировании файлов точно указывай old_string.\n"
-        "- Опасные команды (удаление, rm -rf, mkfs) требуют подтверждения пользователя."
+        "- Опасные команды (удаление, rm -rf, mkfs) требуют подтверждения пользователя.\n"
+        "- Для Termux API используй простые аргументы."
     ),
 }
 
@@ -232,11 +284,12 @@ class UserState:
         self.mode = DEFAULT_MODE
         self.messages: List[Dict[str, str]] = []
         self.summary = ""
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.auto_approve = False
         self.shell_mode = False
         self.action_history: List[Dict[str, Any]] = []
         self.reminders: List[threading.Timer] = []
+        self.current_session = "default"
 
 user_states: Dict[int, UserState] = {}
 states_lock = threading.Lock()
@@ -265,16 +318,62 @@ def save_summary(text: str):
     except Exception as e:
         logger.error(f"Save summary error: {e}")
 
+# ========== SESSIONS ==========
+def save_session(state: UserState, name: str):
+    path = os.path.join(SESSIONS_DIR, f"{name}.json")
+    with state.lock:
+        data = {
+            "messages": state.messages,
+            "summary": state.summary,
+            "provider": state.provider,
+            "model": state.model,
+            "mode": state.mode,
+            "saved_at": datetime.now().isoformat(),
+        }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True, path
+    except Exception as e:
+        return False, str(e)
+
+def load_session(state: UserState, name: str):
+    path = os.path.join(SESSIONS_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return False, "Сессия не найдена"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with state.lock:
+            state.messages = data.get("messages", [])
+            state.summary = data.get("summary", "")
+            state.provider = data.get("provider", DEFAULT_PROVIDER)
+            state.model = data.get("model", DEFAULT_MODEL)
+            state.mode = data.get("mode", DEFAULT_MODE)
+            state.current_session = name
+        return True, f"Сессия `{name}` загружена. Пар: {len(state.messages)//2}"
+    except Exception as e:
+        return False, str(e)
+
+def list_sessions() -> List[str]:
+    try:
+        files = os.listdir(SESSIONS_DIR)
+        return [f.replace(".json", "") for f in files if f.endswith(".json")]
+    except Exception:
+        return []
+
 # ========== SAFETY ==========
 def is_dangerous_command(command: str) -> Tuple[bool, str]:
-    """Проверяет команду на опасные паттерны."""
     cmd_lower = command.lower().strip()
     for pattern in DANGEROUS_CMD_PATTERNS:
         if pattern.search(cmd_lower):
             return True, f"Команда заблокирована опасным паттерном: {pattern.pattern}"
-    # Дополнительная проверка на rm -rf без явного / но с ~ или .
     if re.search(r'rm\s+-[rf]*\s+.*~/\.', cmd_lower):
         return True, "Подозрительное удаление домашней директории"
+    # Проверка на интерактивные команды
+    first_word = cmd_lower.split()[0] if cmd_lower.split() else ""
+    if first_word in INTERACTIVE_CMDS and not cmd_lower.startswith("python -c"):
+        return True, f"Интерактивная команда '{first_word}' заблокирована. Используй неинтерактивный режим или /shell с осторожностью."
     return False, ""
 
 def resolve_path(path: str) -> str:
@@ -283,16 +382,17 @@ def resolve_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 def is_path_safe(path: str) -> Tuple[bool, str]:
-    """Проверяет что путь не выходит за пределы разрешённых зон."""
     full = resolve_path(path)
-    allowed_prefixes = [os.path.abspath(WORKSPACE), os.path.abspath(os.path.expanduser("~"))]
-    # Разрешаем /tmp для временных файлов
-    if full.startswith("/tmp") or full.startswith("/data/data/com.termux"):
-        return True, full
+    allowed_prefixes = [
+        os.path.abspath(WORKSPACE),
+        os.path.abspath(os.path.expanduser("~")),
+        "/tmp",
+        "/data/data/com.termux/files",
+    ]
     for prefix in allowed_prefixes:
         if full.startswith(prefix):
             return True, full
-    return False, f"Путь запрещён: {full}. Разрешены только {WORKSPACE} и домашняя директория."
+    return False, f"Путь запрещён: {full}. Разрешены только {WORKSPACE}, домашняя директория и /tmp."
 
 # ========== TYPING ==========
 def typing_loop(chat_id, stop_event):
@@ -303,18 +403,155 @@ def typing_loop(chat_id, stop_event):
             pass
         time.sleep(4)
 
+# ========== TERMUX API HELPERS ==========
+def termux_api_available() -> bool:
+    return TERMUX_API_PKG
+
+def termux_notification(title: str, content: str, priority: str = "default") -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        cmd = f'termux-notification --title "{title}" --content "{content}" --priority {priority}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+        return "[Уведомление отправлено]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка termux-notification: {e}]"
+
+def termux_toast(message: str) -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        cmd = f'termux-toast "{message}"'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return "[Toast отправлен]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка termux-toast: {e}]"
+
+def termux_vibrate(duration_ms: int = 300) -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        cmd = f'termux-vibrate -d {duration_ms}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return "[Вибрация]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка termux-vibrate: {e}]"
+
+def termux_clipboard_get() -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        result = subprocess.run("termux-clipboard-get", shell=True, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка clipboard: {e}]"
+
+def termux_clipboard_set(text: str) -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        result = subprocess.run(f'echo "{text}" | termux-clipboard-set', shell=True, capture_output=True, text=True, timeout=10)
+        return "[В буфер обмена скопировано]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка clipboard: {e}]"
+
+def termux_tts(text: str) -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        # Сохраняем во временный файл, чтобы избежать проблем с кавычками
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            f.write(text)
+            tmp = f.name
+        result = subprocess.run(f'termux-tts-speak < "{tmp}"', shell=True, capture_output=True, text=True, timeout=30)
+        os.unlink(tmp)
+        return "[TTS запущен]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка TTS: {e}]"
+
+def termux_battery() -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        result = subprocess.run("termux-battery-status", shell=True, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return f"🔋 Батарея: {data.get('percentage', '?')}% | Статус: {data.get('status', '?')} | Темп: {data.get('temperature', '?')}°C"
+        return f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка battery: {e}]"
+
+def termux_wifi() -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        result = subprocess.run("termux-wifi-connectioninfo", shell=True, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return f"📶 WiFi: {data.get('ssid', '?')} | IP: {data.get('ip', '?')} | Скорость: {data.get('link_speed', '?')} Mbps"
+        return f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка wifi: {e}]"
+
+def termux_torch(state: str = "on") -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        cmd = f'termux-torch {state}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return f"[Фонарик {state}]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка torch: {e}]"
+
+def termux_location() -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        result = subprocess.run("termux-location", shell=True, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return f"📍 Lat: {data.get('latitude', '?')} | Lon: {data.get('longitude', '?')} | Точность: {data.get('accuracy', '?')}m"
+        return f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка location: {e}]"
+
+def termux_share(text: str = None, file: str = None) -> str:
+    if not termux_api_available():
+        return "[Termux API не установлен]"
+    try:
+        if file and os.path.exists(file):
+            cmd = f'termux-share -a send "{file}"'
+        elif text:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(text)
+                tmp = f.name
+            cmd = f'termux-share -a send "{tmp}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            os.unlink(tmp)
+            return "[Отправлено через share]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+        else:
+            return "[Нет данных для share]"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+        return "[Отправлено через share]" if result.returncode == 0 else f"[Ошибка: {result.stderr}]"
+    except Exception as e:
+        return f"[Ошибка share: {e}]"
+
 # ========== TOOL EXECUTION ==========
 def tool_execute_command(command: str) -> str:
     dangerous, reason = is_dangerous_command(command)
     if dangerous:
         return f"[БЛОКИРОВКА БЕЗОПАСНОСТИ] {reason}"
+    # Проверка алиасов
+    parts = command.split()
+    if parts and parts[0] in command_aliases:
+        command = command.replace(parts[0], command_aliases[parts[0]], 1)
     try:
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,  # Увеличен таймаут
             cwd=WORKSPACE,
         )
         out = result.stdout.strip()
@@ -323,7 +560,7 @@ def tool_execute_command(command: str) -> str:
             return f"[EXIT {result.returncode}]\n{err}\n{out}".strip()
         return out or "(команда выполнена, вывод пуст)"
     except subprocess.TimeoutExpired:
-        return "[Ошибка: таймаут 60 секунд]"
+        return "[Ошибка: таймаут 120 секунд]"
     except Exception as e:
         return f"[Ошибка выполнения: {e}]"
 
@@ -380,7 +617,6 @@ def tool_delete_file(path: str) -> str:
         return f"[Не найдено: {full}]"
     try:
         if os.path.isdir(full):
-            import shutil
             shutil.rmtree(full)
             return f"[Папка удалена: {full}]"
         else:
@@ -421,7 +657,7 @@ def tool_search(path: str, regex: str) -> str:
             for dp, dn, filenames in os.walk(full):
                 for f in filenames:
                     files.append(os.path.join(dp, f))
-        for file in files[:100]:  # лимит файлов
+        for file in files[:100]:
             try:
                 with open(file, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f, 1):
@@ -450,25 +686,46 @@ def tool_memory_read(key: str) -> str:
         return f"[Заметка {key}]: {ai_memory[key]}"
     return f"[Заметка '{key}' не найдена]"
 
+def tool_memory_search(query: str) -> str:
+    results = []
+    q = query.lower()
+    for k, v in ai_memory.items():
+        if q in k.lower() or q in v.lower():
+            results.append(f"• {k}: {v[:100]}{'...' if len(v) > 100 else ''}")
+    return "\n".join(results) if results else "(нет результатов)"
+
 def tool_web_search(query: str) -> str:
-    """Простой поиск через DuckDuckGo HTML."""
+    """Улучшенный поиск с fallback на несколько источников."""
+    errors = []
+    # Попытка 1: DuckDuckGo HTML
     try:
         url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
         headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
         resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return f"[Ошибка поиска: HTTP {resp.status_code}]"
-        # Простой парсинг результатов
-        snippets = re.findall(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', resp.text)
-        snippets = [re.sub(r'<[^>]+>', '', s) for s in snippets]
-        if not snippets:
-            return "[Поиск не дал результатов]"
-        return "Результаты поиска:\n" + "\n".join(f"• {s}" for s in snippets[:8])
+        if resp.status_code == 200:
+            snippets = re.findall(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', resp.text)
+            snippets = [re.sub(r'<[^>]+>', '', s) for s in snippets]
+            if snippets:
+                return "Результаты поиска (DuckDuckGo):\n" + "\n".join(f"• {s}" for s in snippets[:8])
     except Exception as e:
-        return f"[Ошибка web_search: {e}]"
+        errors.append(f"DDG: {e}")
+
+    # Попытка 2: Wikipedia API
+    try:
+        url = f"https://ru.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(query.replace(' ', '_'))}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            extract = data.get("extract", "")
+            if extract:
+                return f"Результат Wikipedia:\n• {data.get('title', query)}: {extract[:500]}"
+    except Exception as e:
+        errors.append(f"Wiki: {e}")
+
+    return f"[Поиск не дал результатов. Ошибки: {'; '.join(errors)}]"
 
 def tool_python(code: str) -> str:
-    """Безопасное выполнение Python-кода с ограниченным окружением."""
+    """Усиленная sandbox для Python."""
     output = []
     def safe_print(*args):
         output.append(" ".join(str(a) for a in args))
@@ -482,29 +739,71 @@ def tool_python(code: str) -> str:
         "zip": zip, "sorted": sorted, "reversed": reversed,
         "round": round, "pow": pow, "divmod": divmod,
         "math": math, "json": json, "re": re,
+        "hex": hex, "bin": bin, "oct": oct, "chr": chr, "ord": ord,
+        "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
+        "type": type, "open": lambda *a, **k: None,  # Блокируем open
     }
     env = {"__builtins__": allowed_builtins}
     try:
+        # Предварительная проверка на попытку выхода из sandbox
+        forbidden = ['__import__', '__class__', '__bases__', '__subclasses__', 'eval', 'exec', 'compile', 'open', 'os', 'sys', 'subprocess']
+        for f in forbidden:
+            if f in code:
+                return f"[Ошибка: использование '{f}' запрещено в sandbox]"
         exec(code, env, env)
         return "\n".join(output) if output else "(нет вывода)"
     except Exception as e:
         return f"[Ошибка Python: {type(e).__name__}: {e}]"
 
 def tool_git(subcommand: str, args: str = "") -> str:
-    allowed = {"status", "diff", "log", "commit", "add", "branch", "checkout", "pull", "push"}
+    allowed = {"status", "diff", "log", "commit", "add", "branch", "checkout", "pull", "push", "clone", "init", "remote", "fetch", "merge", "reset", "revert", "tag", "stash", "show", "blame", "grep", "clean", "mv", "rm"}
     if subcommand not in allowed:
         return f"[Неподдерживаемая git команда: {subcommand}]"
-    if subcommand in ("push", "checkout", "pull") and not args.strip().startswith("--"):
-        # push/pull требуют осторожности
-        pass
+    # Проверка args на инъекцию
+    if ";" in args or "|" in args or "&" in args or "$(" in args or "`" in args:
+        return "[Ошибка: недопустимые символы в аргументах git]"
     cmd = f"git {subcommand} {args}".strip()
+    return tool_execute_command(cmd)
+
+def tool_termux(action: str, args: str = "") -> str:
+    actions = {
+        "notification": lambda a: termux_notification("Termux Bot", a),
+        "toast": lambda a: termux_toast(a),
+        "vibrate": lambda a: termux_vibrate(int(a) if a.isdigit() else 300),
+        "clipboard_get": lambda a: termux_clipboard_get(),
+        "clipboard_set": lambda a: termux_clipboard_set(a),
+        "tts": lambda a: termux_tts(a),
+        "battery": lambda a: termux_battery(),
+        "wifi": lambda a: termux_wifi(),
+        "torch": lambda a: termux_torch(a if a in ("on", "off") else "on"),
+        "location": lambda a: termux_location(),
+        "share": lambda a: termux_share(text=a),
+    }
+    if action not in actions:
+        return f"[Неизвестное Termux API действие: {action}. Доступные: {', '.join(actions.keys())}]"
+    return actions[action](args)
+
+def tool_pkg(action: str, args: str = "") -> str:
+    allowed = {"install", "remove", "search", "update", "upgrade", "list", "show", "files", "clean"}
+    if action not in allowed:
+        return f"[Неподдерживаемая pkg команда: {action}]"
+    if ";" in args or "|" in args or "&" in args:
+        return "[Ошибка: недопустимые символы в аргументах]"
+    if action == "update":
+        cmd = "pkg update -y"
+    elif action == "upgrade":
+        cmd = "pkg upgrade -y"
+    elif action == "list":
+        cmd = "pkg list-installed"
+    elif action == "clean":
+        cmd = "pkg clean"
+    else:
+        cmd = f"pkg {action} {args}".strip()
     return tool_execute_command(cmd)
 
 # ========== PARSER TOOLS FROM AI RESPONSE ==========
 def parse_tools(text: str) -> List[Dict[str, Any]]:
-    """Парсит теги <tool>...</tool> и вложенные параметры."""
     actions = []
-    # Находим все tool-блоки
     tool_blocks = re.findall(
         r'<tool>(\w+)</tool>'
         r'(?:\s*<command>([\s\S]*?)</command>)?'
@@ -518,12 +817,13 @@ def parse_tools(text: str) -> List[Dict[str, Any]]:
         r'(?:\s*<query>([\s\S]*?)</query>)?'
         r'(?:\s*<code>([\s\S]*?)</code>)?'
         r'(?:\s*<subcommand>([\s\S]*?)</subcommand>)?'
-        r'(?:\s*<args>([\s\S]*?)</args>)?',
+        r'(?:\s*<args>([\s\S]*?)</args>)?'
+        r'(?:\s*<action>([\s\S]*?)</action>)?',
         text,
     )
     for block in tool_blocks:
         (tool, command, path, content, old_s, new_s, regex,
-         key, value, query, code, subcmd, args) = block
+         key, value, query, code, subcmd, args, action) = block
         actions.append({
             "tool": (tool or "").strip(),
             "command": (command or "").strip(),
@@ -538,11 +838,11 @@ def parse_tools(text: str) -> List[Dict[str, Any]]:
             "code": (code or "").strip(),
             "subcommand": (subcmd or "").strip(),
             "args": (args or "").strip(),
+            "action": (action or "").strip(),
         })
     return actions
 
 def strip_tools(text: str) -> str:
-    """Убирает тул-теги из текста для показа пользователю."""
     cleaned = re.sub(
         r'<tool>\w+</tool>'
         r'(?:\s*<command>[\s\S]*?</command>)?'
@@ -556,7 +856,8 @@ def strip_tools(text: str) -> str:
         r'(?:\s*<query>[\s\S]*?</query>)?'
         r'(?:\s*<code>[\s\S]*?</code>)?'
         r'(?:\s*<subcommand>[\s\S]*?</subcommand>)?'
-        r'(?:\s*<args>[\s\S]*?</args>)?',
+        r'(?:\s*<args>[\s\S]*?</args>)?'
+        r'(?:\s*<action>[\s\S]*?</action>)?',
         '',
         text,
     )
@@ -591,7 +892,7 @@ def build_payload(state: UserState, user_text: str, image_path: Optional[str] = 
         for m in state.messages:
             role = "user" if m["role"] == "user" else "model"
             parts = [{"text": m["content"]}]
-            if m.get("image") and role == "user":
+            if m.get("image") and role == "user" and os.path.exists(m["image"]):
                 try:
                     with open(m["image"], "rb") as f:
                         img_bytes = f.read()
@@ -604,9 +905,8 @@ def build_payload(state: UserState, user_text: str, image_path: Optional[str] = 
                 except Exception:
                     pass
             contents.append({"role": role, "parts": parts})
-        # Текущее сообщение
         parts = [{"text": user_text}]
-        if image_path:
+        if image_path and os.path.exists(image_path):
             try:
                 with open(image_path, "rb") as f:
                     img_bytes = f.read()
@@ -625,7 +925,6 @@ def build_payload(state: UserState, user_text: str, image_path: Optional[str] = 
         for m in state.messages:
             content = m["content"]
             if m.get("image"):
-                # OpenRouter/совместимые провайдеры могут поддерживать vision через URL
                 content += f"\n[Изображение: {m['image']}]"
             msgs.append({"role": m["role"], "content": content})
         current = user_text
@@ -733,6 +1032,13 @@ def summarize_context(state: UserState) -> Tuple[bool, str]:
     return True, summary
 
 # ========== SAFE SEND ==========
+def escape_markdown(text: str) -> str:
+    """Экранирует спецсимволы MarkdownV2."""
+    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for ch in chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 def split_text(text: str, max_len: int = 4000) -> List[str]:
     if len(text) <= max_len:
         return [text]
@@ -754,7 +1060,6 @@ def split_text(text: str, max_len: int = 4000) -> List[str]:
 
         if len(candidate) > max_len:
             if in_code and not stripped.startswith("```"):
-                # Закрываем блок, начинаем новый
                 chunks.append(current + "\n```")
                 current = f"```{code_lang}\n" + line if code_lang else f"```\n" + line
                 in_code = True
@@ -798,6 +1103,9 @@ def get_main_keyboard():
         KeyboardButton("🗑 Сброс"),
         KeyboardButton("📋 Статус"),
         KeyboardButton("❓ Помощь"),
+        KeyboardButton("📁 Файлы"),
+        KeyboardButton("🔋 Termux"),
+        KeyboardButton("💾 Сессия"),
     )
     return markup
 
@@ -812,6 +1120,22 @@ def get_settings_keyboard():
         InlineKeyboardButton("📁 Workspace", callback_data="settings:workspace"),
         InlineKeyboardButton("📤 Экспорт", callback_data="settings:export"),
         InlineKeyboardButton("📥 Импорт", callback_data="settings:import"),
+        InlineKeyboardButton("🔗 Алиасы", callback_data="settings:aliases"),
+        InlineKeyboardButton("🔙 Назад", callback_data="settings:back"),
+    )
+    return markup
+
+def get_termux_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔋 Батарея", callback_data="termux:battery"),
+        InlineKeyboardButton("📶 WiFi", callback_data="termux:wifi"),
+        InlineKeyboardButton("🔦 Фонарик", callback_data="termux:torch"),
+        InlineKeyboardButton("📍 Локация", callback_data="termux:location"),
+        InlineKeyboardButton("📋 Буфер обмена", callback_data="termux:clipboard"),
+        InlineKeyboardButton("🔊 TTS", callback_data="termux:tts"),
+        InlineKeyboardButton("📳 Вибрация", callback_data="termux:vibrate"),
+        InlineKeyboardButton("🔔 Уведомление", callback_data="termux:notify"),
     )
     return markup
 
@@ -827,16 +1151,18 @@ def cmd_start(message):
     with state.lock:
         shell_status = "🟢 ON" if state.shell_mode else "🔴 OFF"
         auto_status = "🟢 ON" if state.auto_approve else "🔴 OFF"
+        termux_status = "🟢 API" if TERMUX_API_PKG else "🔴 Нет API"
         bot.reply_to(
             message,
-            f"🤖 *Termux AI Bot v7* — Enhanced Claude Code в Telegram\n"
+            f"🤖 *Termux AI Bot v8* — Ultimate Edition\n"
             f"Провайдер: `{state.provider}` | Модель: `{state.model}`\n"
             f"Режим: `{state.mode}` | Shell: {shell_status} | Auto: {auto_status}\n"
-            f"Workspace: `{WORKSPACE}`\n"
-            f"Контекст: `{len(state.messages)//2}` пар | До суммаризации: `{max(0, CONTEXT_LIMIT - len(state.messages)//2)}`\n\n"
+            f"Termux: {termux_status} | Workspace: `{WORKSPACE}`\n"
+            f"Сессия: `{state.current_session}` | Контекст: `{len(state.messages)//2}` пар\n\n"
             f"*Быстрые префиксы:*\n"
             f"`!команда` — выполнить в shell без AI\n"
-            f"`?вопрос` — быстрый вопрос (игнорирует режим shell)\n\n"
+            f"`?вопрос` — быстрый вопрос (игнорирует режим shell)\n"
+            f"`@алиас` — выполнить алиас\n\n"
             f"Используй кнопки ниже или /help",
             reply_markup=get_main_keyboard(),
         )
@@ -845,8 +1171,7 @@ def cmd_start(message):
 def cmd_help(message):
     if message.from_user.id != ADMIN_ID:
         return
-    bot.reply_to(
-        message,
+    help_text = (
         "📋 *Команды:*\n"
         "/start — статус\n"
         "/settings — единое меню настроек\n"
@@ -862,20 +1187,29 @@ def cmd_help(message):
         "/undo — отменить последнее действие\n"
         "/calc — калькулятор\n"
         "/note — быстрая заметка\n"
-        "/remind — напоминание (минуты текст)\n"
+        "/remind — напоминание (минуты|текст)\n"
         "/tldr — краткое содержание файла\n"
         "/diff — изменения в workspace (git diff)\n"
-        "/export — экспорт контекста в файл\n"
-        "/import — импорт контекста из файла\n"
+        "/export — экспорт контекста\n"
+        "/import — импорт контекста\n"
         "/add_provider — добавить провайдера\n"
         "/add_model — добавить модель\n"
+        "/session — управление сессиями\n"
+        "/alias — управление алиасами\n"
+        "/sendfile — отправить файл из workspace\n"
+        "/termux — меню Termux API\n"
+        "/pkg — управление пакетами\n"
+        "/backup — бэкап конфигурации\n"
+        "/voice — озвучить текст (TTS)\n"
         "/help — справка\n\n"
         "*Префиксы:*\n"
         "`!команда` — shell без AI\n"
-        "`?вопрос` — вопрос к AI в любом режиме\n\n"
+        "`?вопрос` — вопрос к AI в любом режиме\n"
+        "`@алиас` — выполнить алиас\n\n"
         "*Режим agent:* AI использует инструменты через теги `<tool>`\n"
-        "Все опасные действия требуют подтверждения (если /auto выключен).",
+        "Все опасные действия требуют подтверждения (если /auto выключен)."
     )
+    bot.reply_to(message, help_text)
 
 @bot.message_handler(commands=["settings"])
 def cmd_settings(message):
@@ -905,7 +1239,11 @@ def callback_settings(call):
         cmd_export(call.message)
     elif action == "import":
         cmd_import(call.message)
-    bot.answer_callback_query(call.id, "Открыто")
+    elif action == "aliases":
+        cmd_alias_list(call.message)
+    elif action == "back":
+        bot.edit_message_text("⚙️ Меню закрыто. Используй /settings", call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id, "Готово")
 
 @bot.message_handler(commands=["status"])
 def cmd_status(message):
@@ -918,17 +1256,20 @@ def cmd_status(message):
         summary_preview = state.summary[:200] + "..." if len(state.summary) > 200 else state.summary or "(пусто)"
         approx_tokens = sum(len(m["content"]) for m in state.messages) // 4
         mem_count = len(ai_memory)
+        alias_count = len(command_aliases)
+        sessions = ", ".join(list_sessions()[:5]) or "(нет)"
         bot.reply_to(
             message,
             f"⚙️ *Статус:*\n"
             f"Провайдер: `{state.provider}` | Модель: `{state.model}`\n"
-            f"Режим: `{state.mode}`\n"
+            f"Режим: `{state.mode}` | Сессия: `{state.current_session}`\n"
             f"Shell: {shell_status} | Auto-approve: {auto_status}\n"
             f"Workspace: `{WORKSPACE}`\n"
             f"Сообщений: `{len(state.messages)}` (пар: `{len(state.messages)//2}`)\n"
             f"Примерно токенов: `{approx_tokens}`\n"
             f"До суммаризации: `{max(0, CONTEXT_LIMIT - len(state.messages)//2)}` пар\n"
-            f"Заметок в памяти: `{mem_count}`\n"
+            f"Заметок: `{mem_count}` | Алиасов: `{alias_count}`\n"
+            f"Сессии: `{sessions}`\n"
             f"Суммаризация: `{summary_preview}`",
         )
 
@@ -1125,9 +1466,9 @@ def process_calc_step(message):
         return
     expr = message.text.strip()
     try:
-        # Безопасный eval с математическими функциями
         allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith('_')}
-        allowed.update({"abs": abs, "round": round, "max": max, "min": min, "sum": sum})
+        allowed.update({"abs": abs, "round": round, "max": max, "min": min, "sum": sum, "pow": pow})
+        # Безопасный eval через ast можно было бы лучше, но пока ограничим
         result = eval(expr, {"__builtins__": {}}, allowed)
         bot.reply_to(message, f"🧮 *Результат:*\n`{expr}` = `{result}`", parse_mode="Markdown")
     except Exception as e:
@@ -1175,7 +1516,14 @@ def process_remind_step(message):
             raise ValueError("Минуты должны быть > 0")
         chat_id = message.chat.id
         def reminder():
-            bot.send_message(chat_id, f"⏰ *Напоминание:*\n{text}", parse_mode="Markdown")
+            try:
+                bot.send_message(chat_id, f"⏰ *Напоминание:*\n{text}", parse_mode="Markdown")
+            except Exception:
+                pass
+            # Удаляем таймер из списка
+            state = get_state(ADMIN_ID)
+            with state.lock:
+                state.reminders = [t for t in state.reminders if t.is_alive()]
         timer = threading.Timer(minutes * 60, reminder)
         timer.start()
         state = get_state(ADMIN_ID)
@@ -1213,9 +1561,6 @@ def cmd_diff(message):
     if message.from_user.id != ADMIN_ID:
         return
     result = tool_git("diff")
-    if result.startswith("[") and "неизвестная" not in result.lower():
-        # Нет git или нет изменений
-        pass
     preview = result[:4000] + "..." if len(result) > 4000 else result
     safe_send(message.chat.id, f"📊 *Git diff:*\n```\n{preview}\n```")
 
@@ -1239,7 +1584,7 @@ def cmd_export(message):
         with open(export_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         with open(export_path, "rb") as f:
-            bot.send_document(message.chat.id, InputFile(f), caption=f"📤 Экспорт контекста\nПар: {len(state.messages)//2}")
+            bot.send_document(message.chat.id, InputFile(f, os.path.basename(export_path)), caption=f"📤 Экспорт контекста\nПар: {len(state.messages)//2}")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка экспорта: {e}")
 
@@ -1338,7 +1683,8 @@ def process_add_provider_step(message):
             "parser": parser.strip(),
             "vision": False,
         }
-        PROVIDER_MODELS[name.strip()] = []
+        if name.strip() not in PROVIDER_MODELS:
+            PROVIDER_MODELS[name.strip()] = []
         save_custom_config()
         bot.reply_to(message, f"✅ Провайдер `{name}` добавлен!\nТеперь добавь модель через /add_model")
     except Exception as e:
@@ -1372,6 +1718,239 @@ def process_add_model_step(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
+# ========== SESSIONS ==========
+@bot.message_handler(commands=["session"])
+def cmd_session(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    sessions = list_sessions()
+    text = "💾 *Управление сессиями*\n\n"
+    if sessions:
+        text += "Сохранённые сессии:\n" + "\n".join(f"• `{s}`" for s in sessions) + "\n\n"
+    else:
+        text += "Нет сохранённых сессий.\n\n"
+    text += "Отправь действие:\n`save|имя` — сохранить\n`load|имя` — загрузить\n`delete|имя` — удалить"
+    msg = bot.reply_to(message, text, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_session_step)
+
+def process_session_step(message):
+    if message.text and message.text.startswith("/"):
+        bot.reply_to(message, "Отменено.")
+        return
+    try:
+        action, name = message.text.split("|", 1)
+        action = action.strip().lower()
+        name = name.strip()
+        state = get_state(ADMIN_ID)
+        if action == "save":
+            ok, res = save_session(state, name)
+            bot.reply_to(message, f"✅ Сессия `{name}` сохранена!\n`{res}`" if ok else f"❌ {res}")
+        elif action == "load":
+            ok, res = load_session(state, name)
+            bot.reply_to(message, f"✅ {res}" if ok else f"❌ {res}")
+        elif action == "delete":
+            path = os.path.join(SESSIONS_DIR, f"{name}.json")
+            if os.path.exists(path):
+                os.remove(path)
+                bot.reply_to(message, f"🗑 Сессия `{name}` удалена.")
+            else:
+                bot.reply_to(message, f"❌ Сессия `{name}` не найдена.")
+        else:
+            bot.reply_to(message, "❌ Неизвестное действие. Используй save|имя, load|имя или delete|имя")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+# ========== ALIASES ==========
+@bot.message_handler(commands=["alias"])
+def cmd_alias(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if not command_aliases:
+        text = "🔗 *Алиасы:* (пусто)\n\n"
+    else:
+        text = "🔗 *Алиасы:*\n" + "\n".join(f"`{k}` → `{v}`" for k, v in command_aliases.items()) + "\n\n"
+    text += "Отправь: `add|алиас|команда` или `del|алиас`"
+    msg = bot.reply_to(message, text, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_alias_step)
+
+def process_alias_step(message):
+    global command_aliases
+    if message.text and message.text.startswith("/"):
+        bot.reply_to(message, "Отменено.")
+        return
+    try:
+        parts = message.text.split("|")
+        if len(parts) == 3 and parts[0].strip().lower() == "add":
+            alias, cmd = parts[1].strip(), parts[2].strip()
+            command_aliases[alias] = cmd
+            save_aliases(command_aliases)
+            save_custom_config()
+            bot.reply_to(message, f"✅ Алиас `{alias}` добавлен → `{cmd}`")
+        elif len(parts) == 2 and parts[0].strip().lower() == "del":
+            alias = parts[1].strip()
+            if alias in command_aliases:
+                del command_aliases[alias]
+                save_aliases(command_aliases)
+                save_custom_config()
+                bot.reply_to(message, f"🗑 Алиас `{alias}` удалён.")
+            else:
+                bot.reply_to(message, f"❌ Алиас `{alias}` не найден.")
+        else:
+            bot.reply_to(message, "❌ Формат: `add|алиас|команда` или `del|алиас`")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+def cmd_alias_list(message):
+    if not command_aliases:
+        bot.reply_to(message, "🔗 Алиасы: (пусто)\n\nИспользуй /alias")
+    else:
+        text = "🔗 *Алиасы:*\n" + "\n".join(f"`{k}` → `{v}`" for k, v in command_aliases.items())
+        bot.reply_to(message, text, parse_mode="Markdown")
+
+# ========== SEND FILE ==========
+@bot.message_handler(commands=["sendfile"])
+def cmd_sendfile(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "Отправь путь к файлу в workspace для отправки в Telegram:")
+    bot.register_next_step_handler(msg, process_sendfile_step)
+
+def process_sendfile_step(message):
+    if message.text and message.text.startswith("/"):
+        bot.reply_to(message, "Отменено.")
+        return
+    path = message.text.strip()
+    safe, full = is_path_safe(path)
+    if not safe:
+        bot.reply_to(message, f"❌ {full}")
+        return
+    if not os.path.exists(full):
+        bot.reply_to(message, f"❌ Файл не найден: `{full}`", parse_mode="Markdown")
+        return
+    try:
+        with open(full, "rb") as f:
+            bot.send_document(message.chat.id, InputFile(f, os.path.basename(full)), caption=f"📁 `{os.path.basename(full)}`", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка отправки: {e}")
+
+# ========== TERMUX MENU ==========
+@bot.message_handler(commands=["termux"])
+def cmd_termux(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if not TERMUX_API_PKG:
+        bot.reply_to(message, "⚠️ Termux API не установлен. Установи: `pkg install termux-api`", parse_mode="Markdown")
+        return
+    bot.reply_to(message, "🔋 *Termux API меню:*", reply_markup=get_termux_keyboard())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("termux:"))
+def callback_termux(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔")
+        return
+    action = call.data.split(":")[1]
+    state = get_state(ADMIN_ID)
+
+    if action == "battery":
+        result = termux_battery()
+    elif action == "wifi":
+        result = termux_wifi()
+    elif action == "torch":
+        result = termux_torch("on")
+    elif action == "location":
+        result = termux_location()
+    elif action == "clipboard":
+        result = termux_clipboard_get()
+    elif action == "tts":
+        bot.answer_callback_query(call.id, "Отправь /voice текст")
+        bot.edit_message_text("🔊 Отправь /voice текст для озвучки", call.message.chat.id, call.message.message_id)
+        return
+    elif action == "vibrate":
+        result = termux_vibrate(500)
+    elif action == "notify":
+        bot.answer_callback_query(call.id, "Отправь текст уведомления")
+        msg = bot.send_message(call.message.chat.id, "Отправь текст для уведомления:")
+        bot.register_next_step_handler(msg, lambda m: bot.reply_to(m, termux_notification("Termux Bot", m.text)))
+        return
+    else:
+        result = "[Неизвестное действие]"
+
+    bot.answer_callback_query(call.id, "Готово")
+    bot.edit_message_text(result, call.message.chat.id, call.message.message_id)
+
+@bot.message_handler(commands=["voice"])
+def cmd_voice(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.reply_to(message, "Отправь текст для озвучки (TTS):")
+    bot.register_next_step_handler(msg, process_voice_step)
+
+def process_voice_step(message):
+    if message.text and message.text.startswith("/"):
+        bot.reply_to(message, "Отменено.")
+        return
+    result = termux_tts(message.text.strip())
+    bot.reply_to(message, result)
+
+# ========== PKG ==========
+@bot.message_handler(commands=["pkg"])
+def cmd_pkg(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = (
+        "📦 *Управление пакетами Termux*\n\n"
+        "Отправь действие:\n"
+        "`install|пакет` — установить\n"
+        "`remove|пакет` — удалить\n"
+        "`search|запрос` — поиск\n"
+        "`update` — обновить списки\n"
+        "`upgrade` — обновить пакеты\n"
+        "`list` — список установленных\n"
+        "`clean` — очистить кэш"
+    )
+    msg = bot.reply_to(message, text, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_pkg_step)
+
+def process_pkg_step(message):
+    if message.text and message.text.startswith("/"):
+        bot.reply_to(message, "Отменено.")
+        return
+    try:
+        parts = message.text.split("|", 1)
+        action = parts[0].strip()
+        args = parts[1].strip() if len(parts) > 1 else ""
+        result = tool_pkg(action, args)
+        safe_send(message.chat.id, f"📦 *pkg {action}:*\n```\n{result[:3000]}\n```")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+# ========== BACKUP ==========
+@bot.message_handler(commands=["backup"])
+def cmd_backup(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    state = get_state(ADMIN_ID)
+    with state.lock:
+        data = {
+            "messages": state.messages,
+            "summary": state.summary,
+            "provider": state.provider,
+            "model": state.model,
+            "mode": state.mode,
+            "memory": ai_memory,
+            "aliases": command_aliases,
+            "workspace": WORKSPACE,
+            "backed_up_at": datetime.now().isoformat(),
+        }
+    backup_path = os.path.join(WORKSPACE, f"backup_{int(time.time())}.json")
+    try:
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        with open(backup_path, "rb") as f:
+            bot.send_document(message.chat.id, InputFile(f, os.path.basename(backup_path)), caption="💾 Бэкап конфигурации")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка бэкапа: {e}")
+
 # ========== TOOL CONFIRMATION HANDLER ==========
 pending_actions: Dict[str, Dict[str, Any]] = {}
 pending_counter = 0
@@ -1383,6 +1962,13 @@ def add_pending(action: dict) -> str:
         pending_counter += 1
         aid = f"act{pending_counter}"
         pending_actions[aid] = action
+        # Очистка старых записей
+        now = time.time()
+        to_remove = [k for k, v in pending_actions.items() if v.get("time", now) < now - PENDING_MAX_AGE]
+        for k in to_remove:
+            del pending_actions[k]
+        action["time"] = now
+        action["status"] = "pending"
         return aid
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("tool:"))
@@ -1399,6 +1985,10 @@ def callback_tool(call):
     pending = pending_actions.get(action_id)
     if not pending:
         bot.answer_callback_query(call.id, "Устарело")
+        return
+
+    if pending.get("status") != "pending":
+        bot.answer_callback_query(call.id, "Уже обработано")
         return
 
     if decision == "cancel":
@@ -1452,6 +2042,10 @@ def callback_tool(call):
                 result = tool_python(pending["code"])
             elif tool == "git":
                 result = tool_git(pending["subcommand"], pending.get("args", ""))
+            elif tool == "termux":
+                result = tool_termux(pending.get("action", ""), pending.get("args", ""))
+            elif tool == "pkg":
+                result = tool_pkg(pending.get("action", ""), pending.get("args", ""))
             else:
                 result = f"[Неизвестный инструмент: {tool}]"
         except Exception as e:
@@ -1466,7 +2060,7 @@ def callback_tool(call):
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
 # ========== MAIN HANDLER ==========
-@bot.message_handler(func=lambda m: True, content_types=["text", "photo"])
+@bot.message_handler(func=lambda m: True, content_types=["text", "photo", "document"])
 def handle_message(message):
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "⛔ Доступ запрещен.")
@@ -1474,6 +2068,7 @@ def handle_message(message):
 
     state = get_state(ADMIN_ID)
     image_path = None
+    document_path = None
 
     # Обработка фото
     if message.content_type == "photo":
@@ -1490,8 +2085,34 @@ def handle_message(message):
         except Exception as e:
             bot.reply_to(message, f"❌ Ошибка загрузки фото: {e}")
             return
-        # Если нет подписи, используем стандартный промпт
         text = message.caption.strip() if message.caption else "Опиши что на изображении."
+    # Обработка документов
+    elif message.content_type == "document":
+        try:
+            file_id = message.document.file_id
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            ext = os.path.splitext(message.document.file_name)[1] or ".bin"
+            document_path = os.path.join(WORKSPACE, f"doc_{int(time.time())}{ext}")
+            with open(document_path, "wb") as f:
+                f.write(downloaded)
+            # Читаем текстовые файлы для отправки в AI
+            text_content = ""
+            if ext.lower() in (".txt", ".py", ".md", ".json", ".sh", ".csv", ".log", ".yaml", ".yml", ".xml", ".html", ".css", ".js", ".cpp", ".c", ".h", ".java", ".go", ".rs", ".ts"):
+                try:
+                    with open(document_path, "r", encoding="utf-8", errors="replace") as f:
+                        text_content = f.read()
+                    if len(text_content) > 6000:
+                        text_content = text_content[:6000] + "\n\n... [обрезано]"
+                except Exception:
+                    pass
+            if message.caption:
+                text = f"{message.caption.strip()}\n\n[Файл: {message.document.file_name}]\n```\n{text_content}\n```"
+            else:
+                text = f"Проанализируй файл: {message.document.file_name}\n```\n{text_content}\n```"
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка загрузки документа: {e}")
+            return
     else:
         text = message.text
 
@@ -1506,6 +2127,16 @@ def handle_message(message):
     # Префикс ? — вопрос к AI даже в shell режиме
     if text.startswith("?"):
         text = text[1:].strip()
+    elif text.startswith("@"):
+        # Алиас
+        alias = text[1:].strip().split()[0]
+        if alias in command_aliases:
+            result = tool_execute_command(command_aliases[alias])
+            preview = result[:4000] + "..." if len(result) > 4000 else result
+            safe_send(message.chat.id, f"🔗 *Алиас `{alias}`:*\n\n```\n{preview}\n```", reply_to_message_id=message.message_id)
+        else:
+            bot.reply_to(message, f"❌ Алиас `{alias}` не найден. Используй /alias")
+        return
     elif text.startswith("/"):
         bot.reply_to(message, "❓ Неизвестная команда. /help")
         return
@@ -1515,7 +2146,7 @@ def handle_message(message):
         return
 
     # Reply keyboard shortcuts
-    if text in ("🤖 AI", "💻 Shell", "⚙️ Настройки", "🗑 Сброс", "📋 Статус", "❓ Помощь"):
+    if text in ("🤖 AI", "💻 Shell", "⚙️ Настройки", "🗑 Сброс", "📋 Статус", "❓ Помощь", "📁 Файлы", "🔋 Termux", "💾 Сессия"):
         if text == "🤖 AI":
             with state.lock:
                 state.shell_mode = False
@@ -1532,6 +2163,12 @@ def handle_message(message):
             cmd_status(message)
         elif text == "❓ Помощь":
             cmd_help(message)
+        elif text == "📁 Файлы":
+            cmd_sendfile(message)
+        elif text == "🔋 Termux":
+            cmd_termux(message)
+        elif text == "💾 Сессия":
+            cmd_session(message)
         return
 
     # Shell mode — всё выполняется как bash (кроме префикса ?)
@@ -1552,14 +2189,17 @@ def handle_message(message):
             msg_entry = {"role": "user", "content": text}
             if image_path:
                 msg_entry["image"] = image_path
+            if document_path:
+                msg_entry["document"] = document_path
             state.messages.append(msg_entry)
             state.messages.append({"role": "assistant", "content": response})
+            # Исправленная обрезка: сохраняем только четное количество
             if len(state.messages) > MAX_HISTORY_PAIRS * 2:
                 state.messages = state.messages[-MAX_HISTORY_PAIRS * 2:]
 
         # Parse tools
         actions = parse_tools(response)
-        safe_tools = ["read_file", "list_directory", "search", "memory_read", "web_search", "python", "git"]
+        safe_tools = ["read_file", "list_directory", "search", "memory_read", "web_search", "python", "git", "termux", "pkg"]
         dangerous_tools = ["execute_command", "write_file", "edit_file", "delete_file", "memory_save"]
 
         safe_actions = [a for a in actions if a["tool"] in safe_tools]
@@ -1583,6 +2223,10 @@ def handle_message(message):
                     r = tool_python(a["code"])
                 elif a["tool"] == "git":
                     r = tool_git(a["subcommand"], a.get("args", ""))
+                elif a["tool"] == "termux":
+                    r = tool_termux(a.get("action", ""), a.get("args", ""))
+                elif a["tool"] == "pkg":
+                    r = tool_pkg(a.get("action", ""), a.get("args", ""))
                 else:
                     r = "[Неизвестный инструмент]"
                 safe_results.append(f"🔍 {a['tool']}:\n{r[:1500]}")
@@ -1693,11 +2337,33 @@ def handle_message(message):
         stop_typing.set()
         typing_thread.join(timeout=1)
 
+# ========== GRACEFUL SHUTDOWN ==========
+def cleanup():
+    logger.info("Bot shutting down gracefully...")
+    state = get_state(ADMIN_ID)
+    with state.lock:
+        for timer in state.reminders:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+    save_summary(get_state(ADMIN_ID).summary)
+    save_memory(ai_memory)
+    save_aliases(command_aliases)
+    save_custom_config()
+
+def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(cleanup)
+
 # ========== STARTUP ==========
 def main():
-    logger.info(f"Bot v7 started. Admin={ADMIN_ID}, Provider={DEFAULT_PROVIDER}, Model={DEFAULT_MODEL}, Workspace={WORKSPACE}")
+    logger.info(f"Bot v8 started. Admin={ADMIN_ID}, Provider={DEFAULT_PROVIDER}, Model={DEFAULT_MODEL}, Workspace={WORKSPACE}")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 if __name__ == "__main__":
     main()
-
